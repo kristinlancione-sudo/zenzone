@@ -1,1283 +1,803 @@
-<!DOCTYPE html>
-<html lang="en">
+// ============================================================
+// ZEN ZONE METHOD — Course Platform Backend
+// Node.js + Express + Firebase Admin SDK
+// ============================================================
+
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const admin = require('firebase-admin');
+const multer = require('multer');
+const path = require('path');
+const { v4: uuidv4 } = require('uuid');
+require('dotenv').config();
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Trust Render's proxy
+app.set('trust proxy', 1);
+
+// ── FIREBASE ADMIN INIT ──────────────────────────────────────
+// Credentials stored as environment variable in Render
+// (avoids needing serviceAccountKey.json file in the repo)
+const serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_JSON);
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+  storageBucket: process.env.FIREBASE_STORAGE_BUCKET
+});
+
+const db = admin.firestore();
+const bucket = admin.storage().bucket();
+
+// ── MIDDLEWARE ───────────────────────────────────────────────
+app.use(helmet());
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+app.options('*', cors());
+app.use(express.json());
+
+// ── AUTH MIDDLEWARE ──────────────────────────────────────────
+// Verifies Firebase ID token on every protected route
+async function requireAuth(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'No token provided' });
+  }
+  try {
+    const token = authHeader.split('Bearer ')[1];
+    const decoded = await admin.auth().verifyIdToken(token);
+    req.user = decoded;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}
+
+// ── VIDEO UPLOAD CONFIG ──────────────────────────────────────
+// Multer stores file in memory, then we stream to Firebase Storage
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 2 * 1024 * 1024 * 1024 }, // 2GB max
+  fileFilter: (req, file, cb) => {
+    const allowed = ['.mp4', '.mov', '.avi', '.webm'];
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (allowed.includes(ext)) cb(null, true);
+    else cb(new Error('Only video files are allowed (.mp4, .mov, .avi, .webm)'));
+  }
+});
+
+
+// ── SUMMER PLAN: PDF multer config ──────────────────────────
+const pdfUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 }
+});
+
+// ── SUMMER PLAN: In-memory session store ─────────────────────
+const summerSessions = new Map();
+setInterval(() => {
+  const cutoff = Date.now() - 2 * 60 * 60 * 1000;
+  for (const [token, data] of summerSessions.entries()) {
+    if (data.createdAt < cutoff) summerSessions.delete(token);
+  }
+}, 30 * 60 * 1000);
+
+// ────────────────────────────────────────────────────────────
+// ROUTES
+// ────────────────────────────────────────────────────────────
+
+// ── Health check ─────────────────────────────────────────────
+app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
+
+// ── GET: Load student's full progress profile ─────────────────
+// Called when student opens the workbook — restores their state
+app.get('/api/progress', requireAuth, async (req, res) => {
+  try {
+    const doc = await db.collection('users').doc(req.user.uid).get();
+    if (!doc.exists) {
+      // First time — create a blank profile
+      const blank = {
+        uid: req.user.uid,
+        email: req.user.email,
+        name: req.user.name || '',
+        enrolledAt: admin.firestore.FieldValue.serverTimestamp(),
+        quizScores: {},        // { m1: { score: 9, total: 10, passed: true }, ... }
+        practiceVideos: {},    // { p1: { url: '...', submittedAt: '...' }, ... }
+        classplan: null,
+        module3Video: null,
+        capstoneVideo: null,
+        capstoneEval: null,
+        finalExam: null,
+        certificateIssued: false,
+        certificateUrl: null
+      };
+      await db.collection('users').doc(req.user.uid).set(blank);
+      return res.json(blank);
+    }
+    return res.json(doc.data());
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to load progress' });
+  }
+});
+
+// ── POST: Save a quiz result ──────────────────────────────────
+// Body: { quizId: 'm1', answers: {1:'B', 2:'C'...}, total: 10 }
+app.post('/api/quiz', requireAuth, async (req, res) => {
+  const { quizId, answers, total } = req.body;
+
+  if (!quizId || !total || !answers) {
+    return res.status(400).json({ error: 'Missing quizId, answers, or total' });
+  }
+
+  // Server scores everything — answer keys never sent to browser
+  const ANSWER_KEYS = {
+    m1:    { 1:'B',2:'C',3:'B',4:'A',5:'C',6:'B',7:'B',8:'A',9:'B',10:'B' },
+    p1:    { 1:'B',2:'B',3:'C',4:'C',5:'B' },
+    p2:    { 1:'B',2:'B',3:'C',4:'C',5:'B',6:'C',7:'B' },
+    p3:    { 1:'B',2:'B',3:'C',4:'D',5:'B' },
+    p4:    { 1:'B',2:'B',3:'C',4:'B',5:'D' },
+    p5:    { 1:'B',2:'C',3:'C',4:'B',5:'C' },
+    p6:    { 1:'B',2:'C',3:'C',4:'B',5:'C' },
+    p7:    { 1:'D',2:'B',3:'C',4:'C',5:'C' },
+    m3:    { 1:'B',2:'C',3:'C',4:'B',5:'B',6:'B',7:'B' },
+    m4:    { 1:'B',2:'B',3:'B',4:'B',5:'B',6:'C',7:'C',8:'C',9:'B',10:'B' },
+    final: {
+       1:'B', 2:'B', 3:'B', 4:'B', 5:'C', 6:'B', 7:'B', 8:'B', 9:'B',10:'C',
+      11:'B',12:'B',13:'B',14:'B',15:'B',16:'C',17:'B',18:'B',19:'C',20:'C',
+      21:'D',22:'B',23:'D',24:'B',25:'B',26:'B',27:'C',28:'B',29:'B',30:'B',
+      31:'B',32:'B',33:'B',34:'C',35:'B',36:'B',37:'B',38:'C',39:'B',40:'B'
+    }
+  };
+
+  // Server-side re-score to prevent cheating
+  const key = ANSWER_KEYS[quizId];
+  let serverScore = 0;
+  if (key && answers) {
+    Object.keys(key).forEach(q => {
+      if (String(answers[q]) === String(key[q])) serverScore++;
+    });
+  }
+
+  const serverPassed = (serverScore / total) >= 0.8;
+
+  try {
+    await db.collection('users').doc(req.user.uid).set({
+      quizScores: {
+        [quizId]: {
+          score: serverScore,
+          total,
+          passed: serverPassed,
+          submittedAt: new Date().toISOString()
+        }
+      }
+    }, { merge: true });
+
+    // Check if all requirements met → auto-issue certificate
+    await checkAndIssueCertificate(req.user.uid);
+
+    res.json({ score: serverScore, total, passed: serverPassed, answerKey: key || null });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to save quiz result' });
+  }
+});
+
+// ── POST: Upload a practice video (one per pillar, Module 3) ──
+// Field name should be "video", plus body field "videoType"
+// videoType: 'p1','p2','p3','p4','p5','p6','p7','module3','capstone'
+app.post('/api/video/upload', requireAuth, upload.single('video'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No video file received' });
+
+  const { videoType } = req.body;
+  const validTypes = ['p1','p2','p3','p4','p5','p6','p7','module3','capstone'];
+  if (!validTypes.includes(videoType)) {
+    return res.status(400).json({ error: 'Invalid videoType' });
+  }
+
+  try {
+    const ext = path.extname(req.file.originalname).toLowerCase();
+    const filename = `videos/${req.user.uid}/${videoType}_${Date.now()}${ext}`;
+    const file = bucket.file(filename);
+
+    // Stream upload to Firebase Storage
+    const stream = file.createWriteStream({
+      metadata: {
+        contentType: req.file.mimetype,
+        metadata: { uid: req.user.uid, videoType }
+      }
+    });
+
+    stream.on('error', (err) => {
+      console.error('Upload error:', err);
+      res.status(500).json({ error: 'Upload failed' });
+    });
+
+    stream.on('finish', async () => {
+      // Make file readable (or keep private and use signed URLs)
+      await file.makePublic();
+      const publicUrl = `https://storage.googleapis.com/${bucket.name}/${filename}`;
+
+      // Save URL to student profile
+      const fieldKey = videoType === 'capstone' ? 'capstoneVideo'
+                     : videoType === 'module3'   ? 'module3Video'
+                     : `practiceVideos.${videoType}`;
+
+      await db.collection('users').doc(req.user.uid).update({
+        [fieldKey]: {
+          url: publicUrl,
+          filename,
+          submittedAt: admin.firestore.FieldValue.serverTimestamp()
+        }
+      });
+
+      await checkAndIssueCertificate(req.user.uid);
+      res.json({ success: true, url: publicUrl });
+    });
+
+    stream.end(req.file.buffer);
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Upload failed' });
+  }
+});
+
+// ── POST: Save capstone self-evaluation ───────────────────────
+app.post('/api/capstone/eval', requireAuth, async (req, res) => {
+  const { strength, improvement, comments } = req.body;
+  if (!strength || !improvement) {
+    return res.status(400).json({ error: 'Strength and improvement fields are required' });
+  }
+  try {
+    await db.collection('users').doc(req.user.uid).update({
+      capstoneEval: {
+        strength,
+        improvement,
+        comments: comments || '',
+        submittedAt: admin.firestore.FieldValue.serverTimestamp()
+      }
+    });
+    await checkAndIssueCertificate(req.user.uid);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to save evaluation' });
+  }
+});
+
+// ── POST: Save reflection answers ────────────────────────────
+app.post('/api/reflection', requireAuth, async (req, res) => {
+  const { moduleId, answers } = req.body;
+  const validModules = ['m1', 'm2', 'm3', 'm4'];
+  if (!moduleId || !answers || !validModules.includes(moduleId)) {
+    return res.status(400).json({ error: 'Missing or invalid moduleId or answers' });
+  }
+  try {
+    await db.collection('users').doc(req.user.uid).set({
+      reflections: {
+        [moduleId]: {
+          answers,
+          submittedAt: new Date().toISOString()
+        }
+      }
+    }, { merge: true });
+
+    // Check if all requirements met for review notification
+    await checkAndNotifyAdmin(req.user.uid);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to save reflection' });
+  }
+});
+
+// ── Check completion and email admin ─────────────────────────
+async function checkAndNotifyAdmin(uid) {
+  const snap = await db.collection('users').doc(uid).get();
+  if (!snap.exists) return;
+  const data = snap.data();
+
+  if (data.adminNotified) return; // already sent
+
+  const scores      = data.quizScores || {};
+  const reflections = data.reflections || {};
+
+  const REQUIRED_QUIZZES = ['m1','p1','p2','p3','p4','p5','p6','p7','m3','m4','final'];
+  const allQuizzesPassed   = REQUIRED_QUIZZES.every(q => scores[q]?.passed === true);
+  const allReflections     = ['m1','m2','m3','m4'].every(m => !!reflections[m]);
+  const capstoneSubmitted  = !!data.capstone?.status;
+
+  if (!allQuizzesPassed || !allReflections || !capstoneSubmitted) return;
+
+  // All done — email Kristin
+  if (process.env.SENDGRID_API_KEY) {
+    const sgMail = require('@sendgrid/mail');
+    sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+    await sgMail.send({
+      to:      'hello@zenzonemethod.com',
+      from:    'hello@zenzonemethod.com',
+      subject: `🎓 ZZM Certification Review Ready — ${data.email}`,
+      html: `
+        <h2>A student is ready for certification review</h2>
+        <p><strong>Name:</strong> ${data.name || 'Not provided'}</p>
+        <p><strong>Email:</strong> ${data.email}</p>
+        <p><strong>Completed:</strong> ${new Date().toLocaleDateString('en-US', { weekday:'long', year:'numeric', month:'long', day:'numeric' })}</p>
+        <p><strong>All quizzes passed:</strong> ✓</p>
+        <p><strong>All reflections submitted:</strong> ✓</p>
+        <p><strong>Capstone video submitted:</strong> ✓</p>
+        <br>
+        <p>Log in to your admin dashboard to review their reflections and issue their certificate.</p>
+        <a href="https://zen-zone-cert.pages.dev/admin" style="background:#2D7D7D;color:white;padding:12px 24px;border-radius:6px;text-decoration:none;font-weight:bold;">Open Admin Dashboard</a>
+      `
+    });
+    console.log(`📧 Admin notified for ${data.email}`);
+  }
+
+  // Mark as notified so email doesn't fire again
+  await db.collection('users').doc(uid).set({ adminNotified: true }, { merge: true });
+}
+
+// ── POST: Admin — manually issue certificate ──────────────────
+app.post('/api/admin/issue-certificate', requireAuth, async (req, res) => {
+  if (req.user.uid !== process.env.ADMIN_UID) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  const { targetUid } = req.body;
+  if (!targetUid) return res.status(400).json({ error: 'Missing targetUid' });
+
+  try {
+    const snap = await db.collection('users').doc(targetUid).get();
+    if (!snap.exists) return res.status(404).json({ error: 'Student not found' });
+    const data = snap.data();
+
+    const certificateUrl = await generateCertificate(targetUid, data.name || data.email);
+    await db.collection('users').doc(targetUid).set({
+      certificateIssued:   true,
+      certificateUrl,
+      certificateIssuedAt: new Date().toISOString()
+    }, { merge: true });
+
+    // Email student their certificate
+    if (process.env.SENDGRID_API_KEY) {
+      const sgMail = require('@sendgrid/mail');
+      sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+      await sgMail.send({
+        to:      data.email,
+        from:    'hello@zenzonemethod.com',
+        subject: '🎓 Your Zen Zone Method Certificate is Ready!',
+        html: `
+          <h2>Congratulations, ${data.name || 'Instructor'}!</h2>
+          <p>You have successfully completed all requirements for the <strong>Zen Zone Method Certified Instructor</strong> training.</p>
+          <p>Your certificate is ready to view and download:</p>
+          <a href="${certificateUrl}" style="background:#2D7D7D;color:white;padding:12px 24px;border-radius:6px;text-decoration:none;font-weight:bold;">View My Certificate</a>
+          <br><br>
+          <p>Thank you for completing this training. We can't wait to see you teach.</p>
+          <p>— Kristin Miller, Zen Zone Method</p>
+        `
+      });
+    }
+
+    res.json({ success: true, certificateUrl });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to issue certificate' });
+  }
+});
+app.get('/api/certificate', requireAuth, async (req, res) => {
+  try {
+    const doc = await db.collection('users').doc(req.user.uid).get();
+    if (!doc.exists || !doc.data().certificateIssued) {
+      return res.status(403).json({ error: 'Certificate not yet earned' });
+    }
+    res.json({
+      certificateUrl: doc.data().certificateUrl,
+      issuedAt: doc.data().certificateIssuedAt
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to retrieve certificate' });
+  }
+});
+
+// ── POST: Redeem access code (bypass payment) ─────────────────
+app.post('/api/redeem-code', requireAuth, async (req, res) => {
+  const { code } = req.body;
+  if (!code) return res.status(400).json({ error: 'No code provided' });
+
+  // Access codes stored as env var — comma separated
+  // e.g. ACCESS_CODES=ZZM-STAFF-2025,ZZM-INSTRUCTOR-FREE
+  const validCodes = (process.env.ACCESS_CODES || '').split(',').map(c => c.trim().toUpperCase());
+  
+  if (!validCodes.includes(code.trim().toUpperCase())) {
+    return res.status(400).json({ error: 'Invalid access code' });
+  }
+
+  try {
+    await db.collection('users').doc(req.user.uid).set({
+      paid:           true,
+      accessCode:     code.trim().toUpperCase(),
+      accessGrantedAt: new Date().toISOString(),
+      paidAt:         new Date().toISOString()
+    }, { merge: true });
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to grant access' });
+  }
+});
+
+// ── POST: Create Stripe checkout session ─────────────────────
+app.post('/api/create-checkout', requireAuth, async (req, res) => {
+  if (!process.env.STRIPE_SECRET_KEY) {
+    return res.status(500).json({ error: 'Stripe not configured' });
+  }
+  const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+  try {
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [{
+        price_data: {
+          currency: 'usd',
+          product_data: {
+            name: 'Zen Zone Method Certified Instructor Training',
+            description: '16-hour online certification for fitness & wellness professionals'
+          },
+          unit_amount: parseInt(process.env.COURSE_PRICE_CENTS || '19700')
+        },
+        quantity: 1
+      }],
+      mode: 'payment',
+      success_url: `${process.env.SITE_URL || 'https://learn.zenzonemethod.com'}?payment=success&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url:  `${process.env.SITE_URL || 'https://learn.zenzonemethod.com'}?payment=cancelled`,
+      customer_email: req.user.email,
+      metadata: { uid: req.user.uid }
+    });
+    res.json({ url: session.url });
+  } catch (err) {
+    console.error('Stripe error:', err);
+    res.status(500).json({ error: 'Failed to create checkout session' });
+  }
+});
+
+// ── POST: Stripe webhook — mark user as paid ──────────────────
+app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!process.env.STRIPE_SECRET_KEY) return res.json({ received: true });
+  const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+  const sig    = req.headers['stripe-signature'];
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    return res.status(400).json({ error: `Webhook error: ${err.message}` });
+  }
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const uid     = session.metadata.uid;
+    if (uid) {
+      await db.collection('users').doc(uid).set({ paid: true, paidAt: new Date().toISOString() }, { merge: true });
+      console.log(`✅ Payment confirmed for uid: ${uid}`);
+    }
+  }
+  res.json({ received: true });
+});
+
+// ── GET: Check if user has paid ───────────────────────────────
+app.get('/api/check-payment', requireAuth, async (req, res) => {
+  try {
+    const snap = await db.collection('users').doc(req.user.uid).get();
+    const paid = snap.exists && snap.data().paid === true;
+    res.json({ paid });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to check payment' });
+  }
+});
+
+// ── GET: Admin — get single student full data ─────────────────
+app.get('/api/admin/student/:uid', requireAuth, async (req, res) => {
+  if (req.user.uid !== process.env.ADMIN_UID) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  try {
+    const snap = await db.collection('users').doc(req.params.uid).get();
+    if (!snap.exists) return res.status(404).json({ error: 'Student not found' });
+    res.json(snap.data());
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to load student' });
+  }
+});
+
+// ── GET: Admin — list all students ───────────────────────────
+app.get('/api/admin/students', requireAuth, async (req, res) => {
+  if (req.user.uid !== process.env.ADMIN_UID) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  try {
+    const snapshot = await db.collection('users').get();
+    const students = snapshot.docs.map(doc => {
+      const d = doc.data();
+      const REQUIRED_QUIZZES     = ['m1','p1','p2','p3','p4','p5','p6','p7','m3','m4','final'];
+      const quizzesPassed        = REQUIRED_QUIZZES.filter(q => d.quizScores?.[q]?.passed).length;
+      const reflectionsSubmitted = ['m1','m2','m3','m4'].filter(m => !!d.reflections?.[m]).length;
+      const capstoneSubmitted    = !!d.capstone?.status;
+      const finalExamPassed      = !!d.quizScores?.final?.passed;
+      const readyForReview       = quizzesPassed === 11 && reflectionsSubmitted === 4 && capstoneSubmitted && finalExamPassed;
+      return {
+        uid:                   d.uid,
+        email:                 d.email,
+        name:                  d.name || '',
+        enrolledAt:            d.enrolledAt,
+        quizzesPassed,
+        reflectionsSubmitted,
+        capstoneSubmitted,
+        finalExamPassed,
+        readyForReview,
+        certificateIssued:     !!d.certificateIssued,
+        certificateUrl:        d.certificateUrl || null,
+        adminNotified:         !!d.adminNotified
+      };
+    });
+    // Sort: ready for review first, then in-progress, then certified
+    students.sort((a, b) => {
+      if (a.readyForReview && !a.certificateIssued) return -1;
+      if (b.readyForReview && !b.certificateIssued) return 1;
+      if (a.certificateIssued) return 1;
+      if (b.certificateIssued) return -1;
+      return 0;
+    });
+    res.json(students);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to load students' });
+  }
+});
+
+// ────────────────────────────────────────────────────────────
+// CERTIFICATE AUTO-ISSUE LOGIC
+// Checks all requirements and issues certificate automatically
+// ────────────────────────────────────────────────────────────
+async function checkAndIssueCertificate(uid) {
+  const doc = await db.collection('users').doc(uid).get();
+  const data = doc.data();
+
+  if (data.certificateIssued) return; // already issued
+
+  const scores = data.quizScores || {};
+  const videos = data.practiceVideos || {};
+
+  const REQUIRED_QUIZZES = ['m1','p1','p2','p3','p4','p5','p6','p7','m3','m4','final'];
+  const REQUIRED_PILLAR_VIDEOS = ['p1','p2','p3','p4','p5','p6','p7'];
+
+  const allQuizzesPassed = REQUIRED_QUIZZES.every(q => scores[q]?.passed === true);
+  const allPillarVideos  = REQUIRED_PILLAR_VIDEOS.every(p => !!videos[p]?.url);
+  const module3Video     = !!data.module3Video?.url;
+  const capstoneVideo    = !!data.capstoneVideo?.url;
+  const capstoneEval     = !!data.capstoneEval;
+
+  if (!allQuizzesPassed || !allPillarVideos || !module3Video || !capstoneVideo || !capstoneEval) {
+    return; // requirements not yet met
+  }
+
+  // All requirements met — generate certificate
+  const certificateUrl = await generateCertificate(uid, data.name || data.email);
+
+  await db.collection('users').doc(uid).update({
+    certificateIssued: true,
+    certificateUrl,
+    certificateIssuedAt: admin.firestore.FieldValue.serverTimestamp()
+  });
+
+  console.log(`✅ Certificate issued for ${data.email}`);
+  // TODO: send congratulations email via SendGrid/Mailgun
+}
+
+// ── Simple certificate generator ─────────────────────────────
+// Generates an HTML certificate and stores it in Firebase Storage
+// You can swap this for a PDF generator (puppeteer) later
+async function generateCertificate(uid, name) {
+  const issuedDate = new Date().toLocaleDateString('en-US', {
+    year: 'numeric', month: 'long', day: 'numeric'
+  });
+
+  const html = `<!DOCTYPE html>
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Zen Zone - Calm bodies. Clear minds. Confident kids.</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Cormorant:wght@300;400;500&family=Jost:wght@300;400;500&display=swap" rel="stylesheet">
-    <style>
-        :root {
-            --ocean: #4A90A4;
-            --sage: #5A9A8E;
-            --forest: #6B9E78;
-            --deep-teal: #2C5F6F;
-            --cream: #F9F7F4;
-            --sand: #E8E3DC;
-            --text-dark: #2C3E3F;
-            --text-light: #6B7E7F;
-        }
-
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        body {
-            font-family: 'Jost', sans-serif;
-            background: var(--cream);
-            color: var(--text-dark);
-            line-height: 1.7;
-            overflow-x: hidden;
-        }
-
-        /* Typography */
-        h1, h2, h3 {
-            font-family: 'Cormorant', serif;
-            font-weight: 300;
-            letter-spacing: 0.02em;
-        }
-
-        h1 {
-            font-size: clamp(3rem, 8vw, 6rem);
-            line-height: 1.1;
-        }
-
-        h2 {
-            font-size: clamp(2.5rem, 6vw, 4.5rem);
-            line-height: 1.2;
-        }
-
-        h3 {
-            font-size: clamp(1.5rem, 4vw, 2.5rem);
-        }
-
-        /* Navigation */
-        nav {
-            position: fixed;
-            top: 0;
-            width: 100%;
-            background: rgba(249, 247, 244, 0.95);
-            backdrop-filter: blur(10px);
-            z-index: 1000;
-            border-bottom: 1px solid rgba(90, 154, 142, 0.1);
-        }
-
-        .nav-container {
-            max-width: 1400px;
-            margin: 0 auto;
-            padding: 1.5rem 3rem;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-
-        .logo-container {
-            display: flex;
-            align-items: center;
-            gap: 1rem;
-        }
-
-        .logo-icon {
-            height: 50px;
-        }
-
-        .logo-text {
-            font-family: 'Cormorant', serif;
-            font-size: 1.8rem;
-            font-weight: 300;
-            letter-spacing: 0.1em;
-            color: var(--deep-teal);
-        }
-
-        .nav-links {
-            display: flex;
-            gap: 2.5rem;
-            list-style: none;
-        }
-
-        .nav-links a {
-            text-decoration: none;
-            color: var(--text-dark);
-            font-weight: 300;
-            font-size: 1rem;
-            letter-spacing: 0.05em;
-            transition: color 0.3s ease;
-            position: relative;
-        }
-
-        .nav-links a::after {
-            content: '';
-            position: absolute;
-            bottom: -5px;
-            left: 0;
-            width: 0;
-            height: 1px;
-            background: var(--ocean);
-            transition: width 0.3s ease;
-        }
-
-        .nav-links a:hover::after {
-            width: 100%;
-        }
-
-        .nav-links a:hover {
-            color: var(--ocean);
-        }
-
-        .cta-button {
-            background: linear-gradient(135deg, var(--ocean), var(--forest));
-            color: white;
-            padding: 0.8rem 2rem;
-            border-radius: 50px;
-            text-decoration: none;
-            font-weight: 400;
-            letter-spacing: 0.05em;
-            transition: transform 0.3s ease, box-shadow 0.3s ease;
-            border: none;
-            cursor: pointer;
-        }
-
-        .cta-button:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 8px 20px rgba(74, 144, 164, 0.3);
-        }
-
-        /* Hero Section */
-        .hero {
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            padding: 8rem 3rem 4rem;
-            background: 
-                radial-gradient(circle at 20% 50%, rgba(107, 158, 120, 0.08) 0%, transparent 50%),
-                radial-gradient(circle at 80% 80%, rgba(74, 144, 164, 0.08) 0%, transparent 50%),
-                var(--cream);
-            position: relative;
-            overflow: hidden;
-        }
-
-        .hero::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            right: 0;
-            width: 60%;
-            height: 100%;
-            background: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 600"><defs><linearGradient id="mtn" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" style="stop-color:%234A90A4;stop-opacity:0.15"/><stop offset="100%" style="stop-color:%236B9E78;stop-opacity:0.15"/></linearGradient></defs><path d="M 0 400 L 100 250 L 200 350 L 300 200 L 400 400 Z" fill="url(%23mtn)"/><path d="M 0 410 Q 100 420, 200 410 T 400 410" fill="none" stroke="%235A9A8E" stroke-width="2" opacity="0.3"/></svg>') no-repeat right center;
-            background-size: contain;
-            opacity: 0.6;
-            animation: float 20s ease-in-out infinite;
-        }
-
-        @keyframes float {
-            0%, 100% { transform: translateY(0) scale(1); }
-            50% { transform: translateY(-20px) scale(1.02); }
-        }
-
-        .hero-content {
-            max-width: 1400px;
-            margin: 0 auto;
-            position: relative;
-            z-index: 1;
-        }
-
-        .hero-badge {
-            display: inline-block;
-            padding: 0.5rem 1.5rem;
-            background: white;
-            border-radius: 50px;
-            font-size: 0.85rem;
-            letter-spacing: 0.1em;
-            text-transform: uppercase;
-            color: var(--sage);
-            margin-bottom: 2rem;
-            box-shadow: 0 4px 15px rgba(0,0,0,0.05);
-            animation: slideDown 0.8s ease-out;
-        }
-
-        @keyframes slideDown {
-            from { opacity: 0; transform: translateY(-20px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-
-        .hero h1 {
-            color: var(--deep-teal);
-            margin-bottom: 1.5rem;
-            animation: fadeInUp 1s ease-out 0.2s both;
-        }
-
-        @keyframes fadeInUp {
-            from { opacity: 0; transform: translateY(30px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-
-        .hero-subtitle {
-            font-size: clamp(1.2rem, 3vw, 1.8rem);
-            color: var(--text-light);
-            max-width: 700px;
-            margin-bottom: 3rem;
-            font-weight: 300;
-            line-height: 1.6;
-            animation: fadeInUp 1s ease-out 0.4s both;
-        }
-
-        .hero-buttons {
-            display: flex;
-            gap: 1.5rem;
-            flex-wrap: wrap;
-            animation: fadeInUp 1s ease-out 0.6s both;
-        }
-
-        .button-secondary {
-            background: white;
-            color: var(--ocean);
-            padding: 0.8rem 2rem;
-            border-radius: 50px;
-            text-decoration: none;
-            font-weight: 400;
-            letter-spacing: 0.05em;
-            transition: all 0.3s ease;
-            border: 1px solid var(--ocean);
-        }
-
-        .button-secondary:hover {
-            background: var(--ocean);
-            color: white;
-            transform: translateY(-2px);
-        }
-
-        /* Classes Section */
-        .classes-section {
-            padding: 8rem 3rem;
-            background: white;
-        }
-
-        .section-container {
-            max-width: 1400px;
-            margin: 0 auto;
-        }
-
-        .section-header {
-            text-align: center;
-            margin-bottom: 5rem;
-        }
-
-        .section-label {
-            font-size: 0.9rem;
-            letter-spacing: 0.2em;
-            text-transform: uppercase;
-            color: var(--sage);
-            margin-bottom: 1rem;
-        }
-
-        .section-header h2 {
-            color: var(--deep-teal);
-            margin-bottom: 1.5rem;
-        }
-
-        .section-subtitle {
-            font-size: 1.2rem;
-            color: var(--text-light);
-            max-width: 700px;
-            margin: 0 auto;
-            font-weight: 300;
-        }
-
-        .classes-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
-            gap: 3rem;
-        }
-
-        .class-card {
-            background: var(--cream);
-            border-radius: 20px;
-            padding: 3rem;
-            transition: transform 0.3s ease, box-shadow 0.3s ease;
-            position: relative;
-            overflow: hidden;
-        }
-
-        .class-card::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 5px;
-            background: linear-gradient(90deg, var(--ocean), var(--forest));
-            transform: scaleX(0);
-            transform-origin: left;
-            transition: transform 0.3s ease;
-        }
-
-        .class-card:hover::before {
-            transform: scaleX(1);
-        }
-
-        .class-card:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 15px 40px rgba(0,0,0,0.1);
-        }
-
-        .class-time {
-            font-size: 0.85rem;
-            color: var(--ocean);
-            font-weight: 500;
-            letter-spacing: 0.1em;
-            text-transform: uppercase;
-            margin-bottom: 1rem;
-        }
-
-        .class-card h3 {
-            color: var(--deep-teal);
-            margin-bottom: 0.5rem;
-        }
-
-        .class-age {
-            color: var(--text-light);
-            font-size: 0.95rem;
-            margin-bottom: 1.5rem;
-        }
-
-        .class-description {
-            color: var(--text-dark);
-            margin-bottom: 2rem;
-            line-height: 1.8;
-        }
-
-        .class-features {
-            list-style: none;
-            margin-bottom: 2rem;
-        }
-
-        .class-features li {
-            padding-left: 1.5rem;
-            margin-bottom: 0.8rem;
-            position: relative;
-            color: var(--text-dark);
-        }
-
-        .class-features li::before {
-            content: '✓';
-            position: absolute;
-            left: 0;
-            color: var(--forest);
-            font-weight: 600;
-        }
-
-        /* Why Section */
-        .why-section {
-            padding: 8rem 3rem;
-            background: linear-gradient(135deg, var(--deep-teal) 0%, var(--ocean) 100%);
-            color: white;
-            position: relative;
-            overflow: hidden;
-        }
-
-        .why-section::before {
-            content: '';
-            position: absolute;
-            width: 500px;
-            height: 500px;
-            border-radius: 50%;
-            background: rgba(255,255,255,0.05);
-            top: -200px;
-            right: -100px;
-        }
-
-        .why-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-            gap: 3rem;
-            margin-top: 4rem;
-        }
-
-        .why-card {
-            text-align: center;
-            padding: 2rem;
-        }
-
-        .why-icon {
-            width: 80px;
-            height: 80px;
-            margin: 0 auto 2rem;
-            background: rgba(255,255,255,0.1);
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 2.5rem;
-            backdrop-filter: blur(10px);
-        }
-
-        .why-card h3 {
-            margin-bottom: 1rem;
-            font-size: 1.8rem;
-        }
-
-        .why-card p {
-            color: rgba(255,255,255,0.9);
-            line-height: 1.8;
-        }
-
-        /* Schedule Section */
-        .schedule-section {
-            padding: 8rem 3rem;
-            background: var(--sand);
-        }
-
-        .schedule-card {
-            background: white;
-            border-radius: 20px;
-            padding: 4rem;
-            max-width: 900px;
-            margin: 4rem auto 0;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.08);
-        }
-
-        .schedule-item {
-            display: grid;
-            grid-template-columns: 120px 1fr auto;
-            gap: 2rem;
-            padding: 2rem 0;
-            border-bottom: 1px solid var(--sand);
-            align-items: center;
-        }
-
-        .schedule-item:last-child {
-            border-bottom: none;
-        }
-
-        .schedule-time {
-            font-family: 'Cormorant', serif;
-            font-size: 1.5rem;
-            color: var(--ocean);
-            font-weight: 400;
-        }
-
-        .schedule-details h4 {
-            font-size: 1.3rem;
-            margin-bottom: 0.3rem;
-            color: var(--deep-teal);
-        }
-
-        .schedule-details p {
-            color: var(--text-light);
-            font-size: 0.95rem;
-        }
-
-        .schedule-price {
-            text-align: right;
-        }
-
-        .price-amount {
-            font-family: 'Cormorant', serif;
-            font-size: 1.8rem;
-            color: var(--deep-teal);
-            font-weight: 400;
-        }
-
-        .price-label {
-            font-size: 0.85rem;
-            color: var(--text-light);
-        }
-
-        /* Pricing Section */
-        .pricing-section {
-            padding: 8rem 3rem;
-            background: white;
-        }
-
-        .pricing-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 2rem;
-            max-width: 1200px;
-            margin: 4rem auto 0;
-        }
-
-        .pricing-card {
-            background: var(--cream);
-            border-radius: 20px;
-            padding: 3rem 2.5rem;
-            text-align: center;
-            position: relative;
-            transition: transform 0.3s ease, box-shadow 0.3s ease;
-        }
-
-        .pricing-card.featured {
-            background: linear-gradient(135deg, var(--ocean), var(--forest));
-            color: white;
-            transform: scale(1.05);
-        }
-
-        .pricing-card:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 15px 40px rgba(0,0,0,0.15);
-        }
-
-        .pricing-card.featured:hover {
-            transform: scale(1.05) translateY(-5px);
-        }
-
-        .pricing-label {
-            font-size: 0.85rem;
-            letter-spacing: 0.15em;
-            text-transform: uppercase;
-            margin-bottom: 1rem;
-            opacity: 0.8;
-        }
-
-        .pricing-card h3 {
-            margin-bottom: 1.5rem;
-        }
-
-        .pricing-amount {
-            font-family: 'Cormorant', serif;
-            font-size: 4rem;
-            font-weight: 300;
-            margin-bottom: 0.5rem;
-        }
-
-        .pricing-per {
-            font-size: 1rem;
-            opacity: 0.8;
-            margin-bottom: 2rem;
-        }
-
-        .pricing-features {
-            list-style: none;
-            margin-bottom: 2.5rem;
-            text-align: left;
-        }
-
-        .pricing-features li {
-            padding: 0.8rem 0;
-            border-bottom: 1px solid rgba(0,0,0,0.05);
-        }
-
-        .pricing-card.featured .pricing-features li {
-            border-bottom-color: rgba(255,255,255,0.2);
-        }
-
-        .pricing-button {
-            width: 100%;
-            padding: 1rem;
-            border-radius: 50px;
-            border: 2px solid var(--ocean);
-            background: white;
-            color: var(--ocean);
-            font-weight: 500;
-            cursor: pointer;
-            transition: all 0.3s ease;
-        }
-
-        .pricing-card.featured .pricing-button {
-            background: white;
-            color: var(--ocean);
-            border-color: white;
-        }
-
-        .pricing-button:hover {
-            background: var(--ocean);
-            color: white;
-        }
-
-        /* About Section */
-        .about-section {
-            padding: 8rem 3rem;
-            background: var(--cream);
-        }
-
-        .about-content {
-            max-width: 900px;
-            margin: 0 auto;
-        }
-
-        .credentials {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 2rem;
-            margin: 4rem 0;
-        }
-
-        .credential-item {
-            padding: 2rem;
-            background: white;
-            border-radius: 15px;
-            text-align: center;
-        }
-
-        .credential-icon {
-            font-size: 2.5rem;
-            margin-bottom: 1rem;
-        }
-
-        .credential-item h4 {
-            color: var(--deep-teal);
-            margin-bottom: 0.5rem;
-        }
-
-        .credential-item p {
-            color: var(--text-light);
-            font-size: 0.95rem;
-        }
-
-        /* Contact Section */
-        .contact-section {
-            padding: 8rem 3rem;
-            background: white;
-        }
-
-        .contact-container {
-            max-width: 1200px;
-            margin: 0 auto;
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 5rem;
-        }
-
-        .contact-form {
-            display: flex;
-            flex-direction: column;
-            gap: 1.5rem;
-        }
-
-        .form-group {
-            display: flex;
-            flex-direction: column;
-            gap: 0.5rem;
-        }
-
-        .form-group label {
-            font-weight: 400;
-            color: var(--text-dark);
-            letter-spacing: 0.05em;
-        }
-
-        .form-group input,
-        .form-group textarea,
-        .form-group select {
-            padding: 1rem 1.5rem;
-            border: 1px solid var(--sand);
-            border-radius: 10px;
-            font-family: 'Jost', sans-serif;
-            font-size: 1rem;
-            background: var(--cream);
-            transition: border-color 0.3s ease;
-        }
-
-        .form-group input:focus,
-        .form-group textarea:focus,
-        .form-group select:focus {
-            outline: none;
-            border-color: var(--ocean);
-        }
-
-        .form-group textarea {
-            resize: vertical;
-            min-height: 150px;
-        }
-
-        .contact-info h3 {
-            color: var(--deep-teal);
-            margin-bottom: 2rem;
-        }
-
-        .info-item {
-            margin-bottom: 2rem;
-        }
-
-        .info-label {
-            font-size: 0.85rem;
-            letter-spacing: 0.1em;
-            text-transform: uppercase;
-            color: var(--sage);
-            margin-bottom: 0.5rem;
-        }
-
-        .info-value {
-            font-size: 1.1rem;
-            color: var(--text-dark);
-        }
-
-        .info-value a {
-            color: var(--ocean);
-            text-decoration: none;
-        }
-
-        /* Footer */
-        footer {
-            background: var(--deep-teal);
-            color: white;
-            padding: 4rem 3rem 2rem;
-        }
-
-        .footer-content {
-            max-width: 1400px;
-            margin: 0 auto;
-            display: grid;
-            grid-template-columns: 2fr 1fr 1fr;
-            gap: 4rem;
-            margin-bottom: 3rem;
-        }
-
-        .footer-about p {
-            color: rgba(255,255,255,0.8);
-            line-height: 1.8;
-            margin: 1rem 0;
-        }
-
-        .footer-links h4 {
-            margin-bottom: 1.5rem;
-            font-size: 1.2rem;
-        }
-
-        .footer-links ul {
-            list-style: none;
-        }
-
-        .footer-links ul li {
-            margin-bottom: 0.8rem;
-        }
-
-        .footer-links a {
-            color: rgba(255,255,255,0.8);
-            text-decoration: none;
-            transition: color 0.3s ease;
-        }
-
-        .footer-links a:hover {
-            color: white;
-        }
-
-        .footer-bottom {
-            border-top: 1px solid rgba(255,255,255,0.1);
-            padding-top: 2rem;
-            text-align: center;
-            color: rgba(255,255,255,0.6);
-        }
-
-        /* Mobile Menu */
-        .mobile-menu-button {
-            display: none;
-            background: none;
-            border: none;
-            font-size: 1.5rem;
-            color: var(--deep-teal);
-            cursor: pointer;
-        }
-
-        /* Responsive */
-        @media (max-width: 768px) {
-            .nav-links {
-                display: none;
-            }
-
-            .mobile-menu-button {
-                display: block;
-            }
-
-            .hero {
-                padding: 6rem 2rem 3rem;
-            }
-
-            .classes-grid {
-                grid-template-columns: 1fr;
-            }
-
-            .contact-container {
-                grid-template-columns: 1fr;
-                gap: 3rem;
-            }
-
-            .footer-content {
-                grid-template-columns: 1fr;
-                gap: 2rem;
-            }
-
-            .schedule-item {
-                grid-template-columns: 1fr;
-                gap: 1rem;
-            }
-
-            .pricing-grid {
-                grid-template-columns: 1fr;
-            }
-
-            .pricing-card.featured {
-                transform: scale(1);
-            }
-        }
-
-        /* Smooth scroll */
-        html {
-            scroll-behavior: smooth;
-        }
-    </style>
+  <meta charset="UTF-8">
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;700&family=DM+Sans:wght@400;600&display=swap');
+    body { margin: 0; background: #FAFAF7; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+    .cert { width: 900px; padding: 80px; border: 3px solid #2D7D7D; background: white; text-align: center; font-family: 'DM Sans', sans-serif; }
+    .brand { font-family: 'Cormorant Garamond', serif; font-size: 13px; letter-spacing: 4px; text-transform: uppercase; color: #2D7D7D; }
+    h1 { font-family: 'Cormorant Garamond', serif; font-size: 52px; color: #1A3A3A; margin: 24px 0 8px; }
+    .subtitle { font-size: 14px; color: #666; letter-spacing: 1px; text-transform: uppercase; }
+    .name { font-family: 'Cormorant Garamond', serif; font-size: 42px; color: #2D7D7D; margin: 40px 0; border-bottom: 2px solid #2D7D7D; display: inline-block; padding-bottom: 8px; }
+    .body { font-size: 15px; color: #444; line-height: 1.7; max-width: 560px; margin: 0 auto 40px; }
+    .date { font-size: 13px; color: #999; margin-top: 48px; }
+    .sig { margin-top: 48px; }
+    .sig-name { font-family: 'Cormorant Garamond', serif; font-size: 22px; color: #1A3A3A; }
+    .sig-title { font-size: 12px; color: #999; letter-spacing: 1px; text-transform: uppercase; }
+  </style>
 </head>
 <body>
-    <!-- Navigation -->
-    <nav>
-        <div class="nav-container">
-            <div class="logo-container">
-                <svg class="logo-icon" viewBox="0 0 350 250" xmlns="http://www.w3.org/2000/svg">
-                    <defs>
-                        <linearGradient id="mountainGradientNav" x1="0%" y1="0%" x2="0%" y2="100%">
-                            <stop offset="0%" style="stop-color:#4A90A4;stop-opacity:1" />
-                            <stop offset="100%" style="stop-color:#6B9E78;stop-opacity:1" />
-                        </linearGradient>
-                    </defs>
-                    <path d="M 40 160 L 100 80 L 160 130 L 220 70 L 280 160 Z" fill="url(#mountainGradientNav)" opacity="0.6"/>
-                    <path d="M 40 160 Q 80 165, 120 160 T 200 160 T 280 160" fill="none" stroke="#5A9A8E" stroke-width="3" stroke-linecap="round" opacity="0.5"/>
-                </svg>
-                <span class="logo-text">ZEN ZONE</span>
-            </div>
-            <ul class="nav-links">
-                <li><a href="#home">Home</a></li>
-                <li><a href="#classes">Classes</a></li>
-                <li><a href="#schedule">Schedule</a></li>
-                <li><a href="#pricing">Pricing</a></li>
-                <li><a href="#about">About</a></li>
-                <li><a href="#contact">Contact</a></li>
-            </ul>
-            <a href="#register" class="cta-button">Register Now</a>
-            <button class="mobile-menu-button">☰</button>
-        </div>
-    </nav>
-
-    <!-- Hero Section -->
-    <section id="home" class="hero">
-        <div class="hero-content">
-            <div class="hero-badge">Starting February 2026</div>
-            <h1>Calm bodies.<br>Clear minds.<br>Confident kids.</h1>
-            <p class="hero-subtitle">
-                A structured children's wellness program teaching yoga, breathwork, and mindfulness 
-                for real-life moments—school, home, transitions, and big feelings.
-            </p>
-            <div class="hero-buttons">
-                <a href="#register" class="cta-button">Register for Classes</a>
-                <a href="#classes" class="button-secondary">Learn More</a>
-            </div>
-        </div>
-    </section>
-
-    <!-- Classes Section -->
-    <section id="classes" class="classes-section">
-        <div class="section-container">
-            <div class="section-header">
-                <div class="section-label">Our Programs</div>
-                <h2>Classes for Every Age</h2>
-                <p class="section-subtitle">
-                    Structured, age-appropriate sessions at Palmetto Bay Recreation Center
-                </p>
-            </div>
-
-            <div class="classes-grid">
-                <div class="class-card">
-                    <div class="class-time">3:00 PM</div>
-                    <h3>Little Movers</h3>
-                    <div class="class-age">Ages 4–6 • 55 minutes</div>
-                    <p class="class-description">
-                        Playful movement, simple breathing exercises, and calming routines designed 
-                        for our youngest learners. We use storytelling, games, and imagination to 
-                        teach self-regulation in a fun, engaging way.
-                    </p>
-                    <ul class="class-features">
-                        <li>Movement-based learning</li>
-                        <li>Emotion recognition games</li>
-                        <li>Simple breathing techniques</li>
-                        <li>Rest and relaxation time</li>
-                    </ul>
-                </div>
-
-                <div class="class-card">
-                    <div class="class-time">4:00 PM</div>
-                    <h3>Focus Club</h3>
-                    <div class="class-age">Ages 7–10 • 55 minutes</div>
-                    <p class="class-description">
-                        Structured yoga flows, mindfulness practices, and tools for focus and 
-                        emotional regulation. Kids learn techniques they can use during tests, 
-                        homework, and moments of stress.
-                    </p>
-                    <ul class="class-features">
-                        <li>Yoga sequences for strength & flexibility</li>
-                        <li>Mindfulness & meditation practice</li>
-                        <li>Stress management tools</li>
-                        <li>Group discussions & reflection</li>
-                    </ul>
-                </div>
-
-                <div class="class-card">
-                    <div class="class-time">5:00 PM</div>
-                    <h3>Family Wind-Down</h3>
-                    <div class="class-age">All ages + caregiver • 55 minutes</div>
-                    <p class="class-description">
-                        A gentle, restorative class for children and their caregivers to practice 
-                        together. Wind down from the day with calming movement, partner poses, 
-                        and breathing exercises the whole family can use at home.
-                    </p>
-                    <ul class="class-features">
-                        <li>Parent-child bonding activities</li>
-                        <li>Partner yoga poses</li>
-                        <li>Guided relaxation for all ages</li>
-                        <li>Take-home calming practices</li>
-                    </ul>
-                </div>
-            </div>
-        </div>
-    </section>
-
-    <!-- Why Section -->
-    <section class="why-section">
-        <div class="section-container">
-            <div class="section-header">
-                <div class="section-label" style="color: rgba(255,255,255,0.8);">Why Zen Zone?</div>
-                <h2>What Makes Us Different</h2>
-            </div>
-
-            <div class="why-grid">
-                <div class="why-card">
-                    <div class="why-icon">🧘</div>
-                    <h3>Structured Method</h3>
-                    <p>Not random yoga classes—a proven, repeatable system kids can use at home and school</p>
-                </div>
-                <div class="why-card">
-                    <div class="why-icon">🌊</div>
-                    <h3>Nervous System First</h3>
-                    <p>Science-backed approach designed for modern family stress and overstimulation</p>
-                </div>
-                <div class="why-card">
-                    <div class="why-icon">📚</div>
-                    <h3>School-Ready Skills</h3>
-                    <p>Tools for classroom focus, test anxiety, transitions, and emotional regulation</p>
-                </div>
-                <div class="why-card">
-                    <div class="why-icon">⭐</div>
-                    <h3>Expert Instruction</h3>
-                    <p>Led by certified yoga instructors with elementary education credentials</p>
-                </div>
-            </div>
-        </div>
-    </section>
-
-    <!-- Schedule Section -->
-    <section id="schedule" class="schedule-section">
-        <div class="section-container">
-            <div class="section-header">
-                <div class="section-label">Weekly Schedule</div>
-                <h2>Palmetto Bay Recreation Center</h2>
-                <p class="section-subtitle">Every week • Drop-ins welcome</p>
-            </div>
-
-            <div class="schedule-card">
-                <div class="schedule-item">
-                    <div class="schedule-time">3:00 PM</div>
-                    <div class="schedule-details">
-                        <h4>Little Movers</h4>
-                        <p>Ages 4–6 • 55 minutes</p>
-                    </div>
-                    <div class="schedule-price">
-                        <div class="price-amount">$25</div>
-                        <div class="price-label">Drop-in</div>
-                    </div>
-                </div>
-
-                <div class="schedule-item">
-                    <div class="schedule-time">4:00 PM</div>
-                    <div class="schedule-details">
-                        <h4>Focus Club</h4>
-                        <p>Ages 7–10 • 55 minutes</p>
-                    </div>
-                    <div class="schedule-price">
-                        <div class="price-amount">$25</div>
-                        <div class="price-label">Drop-in</div>
-                    </div>
-                </div>
-
-                <div class="schedule-item">
-                    <div class="schedule-time">5:00 PM</div>
-                    <div class="schedule-details">
-                        <h4>Family Wind-Down</h4>
-                        <p>All ages + caregiver • 55 minutes</p>
-                    </div>
-                    <div class="schedule-price">
-                        <div class="price-amount">$35</div>
-                        <div class="price-label">Per family</div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </section>
-
-    <!-- Pricing Section -->
-    <section id="pricing" class="pricing-section">
-        <div class="section-container">
-            <div class="section-header">
-                <div class="section-label">Flexible Options</div>
-                <h2>Choose Your Plan</h2>
-            </div>
-
-            <div class="pricing-grid">
-                <div class="pricing-card">
-                    <div class="pricing-label">Drop-In</div>
-                    <h3>Single Class</h3>
-                    <div class="pricing-amount">$25</div>
-                    <div class="pricing-per">per class</div>
-                    <ul class="pricing-features">
-                        <li>Perfect for trying us out</li>
-                        <li>No commitment required</li>
-                        <li>All classes included</li>
-                        <li>Book online or at door</li>
-                    </ul>
-                    <button class="pricing-button">Book a Class</button>
-                </div>
-
-                <div class="pricing-card featured">
-                    <div class="pricing-label">Most Popular</div>
-                    <h3>4-Class Pack</h3>
-                    <div class="pricing-amount">$85</div>
-                    <div class="pricing-per">$21.25 per class</div>
-                    <ul class="pricing-features">
-                        <li>Save $15 vs drop-in</li>
-                        <li>Valid for 2 months</li>
-                        <li>Share with siblings</li>
-                        <li>Mix and match classes</li>
-                    </ul>
-                    <button class="pricing-button">Get Started</button>
-                </div>
-
-                <div class="pricing-card">
-                    <div class="pricing-label">Best Value</div>
-                    <h3>8-Class Pack</h3>
-                    <div class="pricing-amount">$160</div>
-                    <div class="pricing-per">$20 per class</div>
-                    <ul class="pricing-features">
-                        <li>Save $40 vs drop-in</li>
-                        <li>Valid for 3 months</li>
-                        <li>Share with siblings</li>
-                        <li>Priority registration</li>
-                    </ul>
-                    <button class="pricing-button">Get Started</button>
-                </div>
-            </div>
-        </div>
-    </section>
-
-    <!-- About Section -->
-    <section id="about" class="about-section">
-        <div class="section-container">
-            <div class="section-header">
-                <div class="section-label">About</div>
-                <h2>Meet Your Instructor</h2>
-            </div>
-
-            <div class="about-content">
-                <p style="font-size: 1.2rem; color: var(--text-dark); margin-bottom: 2rem; line-height: 1.8;">
-                    Zen Zone Method was created by Kristin Miller, a certified yoga instructor and 
-                    Florida elementary educator with a passion for helping children develop lifelong 
-                    self-regulation skills.
-                </p>
-
-                <div class="credentials">
-                    <div class="credential-item">
-                        <div class="credential-icon">🎓</div>
-                        <h4>FL Teaching Certificate</h4>
-                        <p>Elementary Education</p>
-                    </div>
-                    <div class="credential-item">
-                        <div class="credential-icon">🧘‍♀️</div>
-                        <h4>Certified Yoga Instructor</h4>
-                        <p>Including training in India</p>
-                    </div>
-                    <div class="credential-item">
-                        <div class="credential-icon">🤸</div>
-                        <h4>Movement Specialist</h4>
-                        <p>Former gymnastics coach</p>
-                    </div>
-                    <div class="credential-item">
-                        <div class="credential-icon">👨‍👩‍👧</div>
-                        <h4>Parent Community</h4>
-                        <p>Trusted local educator</p>
-                    </div>
-                </div>
-
-                <p style="color: var(--text-dark); line-height: 1.8;">
-                    With a background in curriculum design, child development, and years of experience 
-                    teaching movement to children, Kristin created Zen Zone Method to give kids practical 
-                    tools for managing stress, building confidence, and developing emotional intelligence 
-                    in an overstimulated world.
-                </p>
-            </div>
-        </div>
-    </section>
-
-    <!-- Contact Section -->
-    <section id="contact" class="contact-section">
-        <div class="section-container">
-            <div class="section-header">
-                <div class="section-label">Get in Touch</div>
-                <h2>Questions? Let's Talk</h2>
-            </div>
-
-            <div class="contact-container">
-                <form class="contact-form" id="register">
-                    <div class="form-group">
-                        <label for="name">Parent/Guardian Name</label>
-                        <input type="text" id="name" name="name" required>
-                    </div>
-
-                    <div class="form-group">
-                        <label for="email">Email</label>
-                        <input type="email" id="email" name="email" required>
-                    </div>
-
-                    <div class="form-group">
-                        <label for="phone">Phone</label>
-                        <input type="tel" id="phone" name="phone">
-                    </div>
-
-                    <div class="form-group">
-                        <label for="child-name">Child's Name & Age</label>
-                        <input type="text" id="child-name" name="child-name" placeholder="e.g., Emma, age 7">
-                    </div>
-
-                    <div class="form-group">
-                        <label for="class">Interested In</label>
-                        <select id="class" name="class">
-                            <option>Little Movers (ages 4-6)</option>
-                            <option>Focus Club (ages 7-10)</option>
-                            <option>Family Wind-Down (all ages)</option>
-                            <option>Not sure yet - just exploring</option>
-                        </select>
-                    </div>
-
-                    <div class="form-group">
-                        <label for="message">Message (Optional)</label>
-                        <textarea id="message" name="message" placeholder="Any questions or special considerations?"></textarea>
-                    </div>
-
-                    <button type="submit" class="cta-button">Send Message</button>
-                </form>
-
-                <div class="contact-info">
-                    <h3>Let's Connect</h3>
-                    
-                    <div class="info-item">
-                        <div class="info-label">Location</div>
-                        <div class="info-value">
-                            Palmetto Bay Recreation Center<br>
-                            Palmetto Bay, FL
-                        </div>
-                    </div>
-
-                    <div class="info-item">
-                        <div class="info-label">Email</div>
-                        <div class="info-value">
-                            <a href="mailto:hello@zenzonemthod.com">hello@zenzonemethod.com</a>
-                        </div>
-                    </div>
-
-                    <div class="info-item">
-                        <div class="info-label">Phone</div>
-                        <div class="info-value">
-                            <a href="tel:+1234567890">(123) 456-7890</a>
-                        </div>
-                    </div>
-
-                    <div class="info-item">
-                        <div class="info-label">Follow Us</div>
-                        <div class="info-value">
-                            <a href="#" style="margin-right: 1rem;">Instagram</a>
-                            <a href="#">Facebook</a>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </section>
-
-    <!-- Footer -->
-    <footer>
-        <div class="footer-content">
-            <div class="footer-about">
-                <div class="logo-container" style="margin-bottom: 1.5rem;">
-                    <svg class="logo-icon" viewBox="0 0 350 250" xmlns="http://www.w3.org/2000/svg">
-                        <defs>
-                            <linearGradient id="mountainGradientFooter" x1="0%" y1="0%" x2="0%" y2="100%">
-                                <stop offset="0%" style="stop-color:#7BC4D8;stop-opacity:1" />
-                                <stop offset="100%" style="stop-color:#A8D5BA;stop-opacity:1" />
-                            </linearGradient>
-                        </defs>
-                        <path d="M 40 160 L 100 80 L 160 130 L 220 70 L 280 160 Z" fill="url(#mountainGradientFooter)" opacity="0.8"/>
-                        <path d="M 40 160 Q 80 165, 120 160 T 200 160 T 280 160" fill="none" stroke="#8ECFBD" stroke-width="3" stroke-linecap="round" opacity="0.7"/>
-                    </svg>
-                    <span class="logo-text" style="color: white;">ZEN ZONE</span>
-                </div>
-                <p>
-                    Teaching children self-regulation, mindfulness, and movement 
-                    for life's most important moments.
-                </p>
-            </div>
-
-            <div class="footer-links">
-                <h4>Quick Links</h4>
-                <ul>
-                    <li><a href="#classes">Classes</a></li>
-                    <li><a href="#schedule">Schedule</a></li>
-                    <li><a href="#pricing">Pricing</a></li>
-                    <li><a href="#about">About</a></li>
-                    <li><a href="#contact">Contact</a></li>
-                </ul>
-            </div>
-
-            <div class="footer-links">
-                <h4>Connect</h4>
-                <ul>
-                    <li><a href="#">Instagram</a></li>
-                    <li><a href="#">Facebook</a></li>
-                    <li><a href="mailto:hello@zenzonemethod.com">Email</a></li>
-                    <li><a href="tel:+1234567890">Phone</a></li>
-                </ul>
-            </div>
-        </div>
-
-        <div class="footer-bottom">
-            <p>&copy; 2026 Zen Zone Method. All rights reserved.</p>
-        </div>
-    </footer>
-
-    <script>
-        // Form submission handling
-        document.querySelector('.contact-form').addEventListener('submit', function(e) {
-            e.preventDefault();
-            alert('Thank you for your interest! We\'ll be in touch soon.');
-            this.reset();
-        });
-
-        // Smooth scroll for navigation
-        document.querySelectorAll('a[href^="#"]').forEach(anchor => {
-            anchor.addEventListener('click', function (e) {
-                e.preventDefault();
-                const target = document.querySelector(this.getAttribute('href'));
-                if (target) {
-                    target.scrollIntoView({
-                        behavior: 'smooth',
-                        block: 'start'
-                    });
-                }
-            });
-        });
-
-        // Mobile menu toggle (basic implementation)
-        document.querySelector('.mobile-menu-button').addEventListener('click', function() {
-            const navLinks = document.querySelector('.nav-links');
-            navLinks.style.display = navLinks.style.display === 'flex' ? 'none' : 'flex';
-        });
-    </script>
+<div class="cert">
+  <div class="brand">Zen Zone Method</div>
+  <h1>Certificate of Completion</h1>
+  <div class="subtitle">This certifies that</div>
+  <div class="name">${name}</div>
+  <div class="body">
+    has successfully completed all requirements of the<br>
+    <strong>Zen Zone Method Certified Instructor Training</strong><br>
+    a 16-hour regulation-based movement program for youth fitness and wellness professionals.
+  </div>
+  <div class="date">Issued: ${issuedDate}</div>
+  <div class="sig">
+    <div class="sig-name">Kristin Miller</div>
+    <div class="sig-title">Founder, Zen Zone Method</div>
+  </div>
+</div>
 </body>
-</html>
+</html>`;
+
+  const filename = `certificates/${uid}/certificate_${Date.now()}.html`;
+  const file = bucket.file(filename);
+  await file.save(html, { contentType: 'text/html' });
+  await file.makePublic();
+
+  return `https://storage.googleapis.com/${bucket.name}/${filename}`;
+}
+
+
+// ── POST: Summer plan — receive data + PDFs, kick off generation ──
+app.post('/summer-generate', pdfUpload.fields([
+  { name: 'elPdf', maxCount: 1 },
+  { name: 'mathPdf', maxCount: 1 }
+]), async (req, res) => {
+  try {
+    const childData = JSON.parse(req.body.childData);
+    const elPdf = req.files['elPdf'][0];
+    const mathPdf = req.files['mathPdf'][0];
+    const token = 'summer_' + uuidv4();
+
+    const session = {
+      childData,
+      elPdfB64: elPdf.buffer.toString('base64'),
+      mathPdfB64: mathPdf.buffer.toString('base64'),
+      status: 'generating',
+      createdAt: Date.now()
+    };
+
+    summerSessions.set(token, session);
+    generateSummerPacket(token, session); // async, non-blocking
+
+    res.json({ token });
+  } catch (err) {
+    console.error('summer-generate error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET: Summer plan — status polling ────────────────────────
+app.get('/summer-status/:token', (req, res) => {
+  const session = summerSessions.get(req.params.token);
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+  res.json({
+    status: session.status,
+    childData: session.childData,
+    worksheetData: session.worksheetData || null,
+    error: session.error || null
+  });
+});
+
+// ── Summer plan generator ─────────────────────────────────────
+async function generateSummerPacket(token, stored) {
+  const { childData, elPdfB64, mathPdfB64 } = stored;
+  try {
+    const gradeNext = { K:'1st', '1':'2nd', '2':'3rd', '3':'4th', '4':'5th' };
+    const styleMap  = { V:'Visual', A:'Auditory', K:'Kinesthetic' };
+
+    const prompt = `Read both FAST PM3 PDFs carefully. Extract every score and domain breakdown.
+
+Generate a summer plan for ${childData.name}, entering ${gradeNext[childData.grade] || 'next'} grade.
+Learning style: ${styleMap[childData.style] || childData.style}
+
+Return this exact JSON with no markdown or code fences:
+{
+  "elLevel": 5,
+  "elPercentile": 90,
+  "elSummary": "2-3 sentences about reading in plain parent language",
+  "mathLevel": 3,
+  "mathPercentile": 72,
+  "mathSummary": "2-3 sentences about math in plain parent language",
+  "elDomains": [
+    {"name": "Alphabetic Principle", "score": 98, "status": "secure", "note": "one plain English sentence"}
+  ],
+  "mathDomains": [
+    {"name": "Operations", "score": 63, "status": "developing", "note": "one plain English sentence"}
+  ],
+  "focusConcepts": [
+    {"concept": "Addition and subtraction to 20", "why": "Operations score: 63 - highest priority"}
+  ]
+}`;
+
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 4000,
+        system: 'You are an expert K-3 educational planner specializing in Florida FAST assessments. Return only valid JSON. No markdown, no code fences, no explanation.',
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: elPdfB64 } },
+            { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: mathPdfB64 } },
+            { type: 'text', text: prompt }
+          ]
+        }]
+      })
+    });
+
+    const data = await response.json();
+    const text = data.content?.find(b => b.type === 'text')?.text || '';
+    const worksheetData = JSON.parse(text.trim());
+
+    await sendSummerEmail(childData, worksheetData);
+
+    stored.status = 'complete';
+    stored.worksheetData = worksheetData;
+
+  } catch (err) {
+    console.error('generateSummerPacket error:', err);
+    stored.status = 'error';
+    stored.error = err.message;
+  }
+}
+
+// ── Summer plan email ─────────────────────────────────────────
+async function sendSummerEmail(childData, worksheetData) {
+  const sgMail = require('@sendgrid/mail');
+  sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+
+  const focusList = (worksheetData.focusConcepts || [])
+    .map(c => `<li style="margin-bottom:10px;font-size:14px;"><strong>${c.concept}</strong><br>
+      <span style="color:#8AADA5;font-size:12px;">${c.why}</span></li>`)
+    .join('');
+
+  await sgMail.send({
+    to: childData.parentEmail,
+    from: 'hello@zenzonemethod.com',
+    subject: `${childData.name}'s Summer Plan is Ready — Zen Zone Method`,
+    html: `
+      <div style="font-family:Georgia,serif;max-width:600px;margin:0 auto;color:#1C3A45;">
+        <div style="background:#2C5F6F;padding:32px;text-align:center;">
+          <h1 style="color:#F9F7F4;font-size:26px;margin:0;font-weight:500;">${childData.name}'s Summer Plan</h1>
+          <p style="color:rgba(249,247,244,.7);margin:8px 0 0;font-size:13px;">Zen Zone Method &mdash; Summer 2026</p>
+        </div>
+        <div style="padding:32px;">
+          <h2 style="color:#2C5F6F;font-size:19px;font-weight:500;">Reading</h2>
+          <p style="font-size:14px;line-height:1.75;">${worksheetData.elSummary || ''}</p>
+          <h2 style="color:#2C5F6F;font-size:19px;font-weight:500;margin-top:22px;">Math</h2>
+          <p style="font-size:14px;line-height:1.75;">${worksheetData.mathSummary || ''}</p>
+          <h2 style="color:#2C5F6F;font-size:19px;font-weight:500;margin-top:22px;">This summer, focus on:</h2>
+          <ol style="padding-left:20px;margin-top:12px;">${focusList}</ol>
+          <p style="font-size:13px;color:#8AADA5;margin-top:28px;padding-top:20px;border-top:1px solid #E4EEEC;">
+            Questions? Reply to this email or reach us at hello@zenzonemethod.com
+          </p>
+        </div>
+        <div style="background:#F9F7F4;padding:16px;text-align:center;font-size:11px;color:#8AADA5;">
+          Zen Zone Method &mdash; zenzonemethod.com
+        </div>
+      </div>`
+  });
+}
+
+// ── START SERVER ─────────────────────────────────────────────
+app.listen(PORT, () => console.log(`ZZM Platform running on port ${PORT}`));
+module.exports = app;
